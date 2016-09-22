@@ -6,7 +6,12 @@
 
 void Routine(RTN rtn, void *v)
 {
-	fprintf(stderr, "routine: %s\n", RTN_Name(rtn).c_str());
+	SEC sec = RTN_Sec(rtn);
+	
+	// Ignore routines that aren't part of the ".kernel" ELF section
+	if (SEC_Name(sec) != ".kernel") return;
+	
+	std::cerr << "Identified kernel routine: " << RTN_Name(rtn) << std::endl;
 }
 
 int main(int argc, char *argv[])
