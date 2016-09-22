@@ -5,6 +5,7 @@
 #include <fstream>
 #include <list>
 
+
 struct KernelRoutineDescriptor
 {
 	KernelRoutineDescriptor() : count(0) { }
@@ -41,10 +42,10 @@ void Routine(RTN rtn, void *v)
 void Fini(INT32 code, void *v)
 {
 	std::cerr << std::endl;
-	std::cerr << "*** SLAMBeanch Completed ***" << std::endl;
+	std::cerr << "*** SLAMBench Completed ***" << std::endl;
 	
 	for (auto descriptor : KernelRoutineDescriptors) {
-		std::cerr << "Kernel: " << descriptor->name << ", Count: " << descriptor->count << std::endl;
+		std::cerr << std::left << std::setw(150) << descriptor->name.c_str() << " -- " << descriptor->count << std::endl;
 		delete descriptor;
 	}
 	
