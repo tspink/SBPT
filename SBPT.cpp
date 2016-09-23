@@ -27,7 +27,26 @@ struct KernelRoutineDescriptor
 	uint64_t start_time;
 };
 
+struct FrameDescriptor
+{
+	std::list<KernelRoutineDescriptor *> kernels;
+};
+
 std::list<KernelRoutineDescriptor *> KernelRoutineDescriptors;
+std::list<FrameDescriptor *> FrameDescriptors;
+
+static FrameDescriptor *CurrentFrame;
+
+void FrameStart()
+{
+	CurrentFrame = new FrameDescriptor();
+	FrameDescriptors.push_back(CurrentFrame);
+}
+
+void FrameEnd()
+{
+	CurrentFrame = NULL;
+}
 
 void KernelRoutineEnter(KernelRoutineDescriptor *descriptor)
 {
@@ -35,6 +54,13 @@ void KernelRoutineEnter(KernelRoutineDescriptor *descriptor)
 		std::cerr << "ASSERTION FAIL: kernel routine " << descriptor->name << " currently executing" << std::endl;
 		exit(0);
 	}
+	
+	if (!CurrentFrame) {
+		std::cerr << "ASSERTION FAIL: not in a frame";
+		exit(0);
+	}
+	
+	CurrentFrame->kernels.push_back(descriptor);
 	
 	descriptor->executing = true;
 	descriptor->count++;
@@ -56,7 +82,24 @@ void KernelRoutineExit(KernelRoutineDescriptor *descriptor)
 
 void Routine(RTN rtn, void *v)
 {
+	// std::cerr << "Routine: " << RTN_Name(rtn) << std::endl;
+	
+	if (RTN_Name(rtn) == "FRAME_START") {
+		std::cerr << "Located FRAME_START directive" << std::endl;
+		RTN_Open(rtn);
+		RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FrameStart, IARG_END);
+		RTN_Close(rtn);
+		return;
+	} else if (RTN_Name(rtn) == "FRAME_END") {
+		std::cerr << "Located FRAME_END directive" << std::endl;
+		RTN_Open(rtn);
+		RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)FrameEnd, IARG_END);
+		RTN_Close(rtn);
+		return;
+	}
+	
 	SEC sec = RTN_Sec(rtn);
+	
 	
 	// Ignore routines that aren't part of the ".kernel" ELF section
 	if (SEC_Name(sec) != ".kernel") return;
@@ -106,7 +149,9 @@ void Fini(INT32 code, void *v)
 	KernelRoutineDescriptors.clear();
 	
 	std::cerr << "Total Execution Count: " << total_executions << std::endl
-			  << "        Total Runtime: " << (total_runtime / 1000) << "ms" << std::endl;	
+			  << "        Total Runtime: " << (total_runtime / 1000) << "ms" << std::endl;
+	
+	std::cerr << "Total Frames: " << FrameDescriptors.size();
 }
 
 int main(int argc, char *argv[])
