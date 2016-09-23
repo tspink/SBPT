@@ -4,21 +4,54 @@
 #include <iomanip>
 #include <fstream>
 #include <list>
+#include <time.h>
 
+static uint64_t now()
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	
+	return tv.tv_sec * 1e6 + tv.tv_usec;
+}
 
 struct KernelRoutineDescriptor
 {
-	KernelRoutineDescriptor() : count(0) { }
+	KernelRoutineDescriptor() : count(0), executing(false) { }
 	
 	uint64_t count;
 	std::string name;
+	
+	std::list<uint64_t> runtimes;
+	
+	bool executing;
+	uint64_t start_time;
 };
 
 std::list<KernelRoutineDescriptor *> KernelRoutineDescriptors;
 
 void KernelRoutineEnter(KernelRoutineDescriptor *descriptor)
 {
+	if (descriptor->executing) {
+		std::cerr << "ASSERTION FAIL: kernel routine " << descriptor->name << " currently executing" << std::endl;
+		exit(0);
+	}
+	
+	descriptor->executing = true;
 	descriptor->count++;
+	descriptor->start_time = now();
+}
+
+void KernelRoutineExit(KernelRoutineDescriptor *descriptor)
+{
+	uint64_t stop_time = now();
+	
+	if (!descriptor->executing) {
+		std::cerr << "ASSERTION FAIL: kernel routine not currently executing" << std::endl;
+		exit(0);
+	}
+	
+	descriptor->executing = false;
+	descriptor->runtimes.push_back(stop_time - descriptor->start_time);
 }
 
 void Routine(RTN rtn, void *v)
@@ -36,6 +69,7 @@ void Routine(RTN rtn, void *v)
 	
 	RTN_Open(rtn);
 	RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)KernelRoutineEnter, IARG_PTR, descriptor, IARG_END);
+	RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)KernelRoutineExit, IARG_PTR, descriptor, IARG_END);
 	RTN_Close(rtn);
 }
 
@@ -44,12 +78,35 @@ void Fini(INT32 code, void *v)
 	std::cerr << std::endl;
 	std::cerr << "*** SLAMBench Completed ***" << std::endl;
 	
+	uint64_t total_executions = 0;
 	for (auto descriptor : KernelRoutineDescriptors) {
-		std::cerr << std::left << std::setw(150) << descriptor->name.c_str() << " -- " << descriptor->count << std::endl;
+		total_executions += descriptor->count;
+	}
+
+	uint64_t total_runtime = 0;
+	for (auto descriptor : KernelRoutineDescriptors) {
+		uint64_t kernel_total_runtime = 0;
+		for (auto runtime : descriptor->runtimes) {
+			kernel_total_runtime += runtime;
+		}
+		
+		total_runtime += kernel_total_runtime;
+		
+		double runtime_average = (double)kernel_total_runtime / descriptor->runtimes.size();
+		
+		std::cerr << "Kernel: " << descriptor->name.c_str() << ":" << std::endl
+		<< "  Execution Count: " << descriptor->count << " (" << std::setprecision(2) << (((double)descriptor->count / (double)total_executions) * 100.0) << "%) " << std::endl
+		<< "    Total Runtime: " << kernel_total_runtime / 1000 << "ms" << std::endl
+		<< "  Average Runtime: " << std::setprecision(5) << (runtime_average / 1000) << "ms" << std::endl
+		<< std::endl;
+		
 		delete descriptor;
 	}
 	
 	KernelRoutineDescriptors.clear();
+	
+	std::cerr << "Total Execution Count: " << total_executions << std::endl
+			  << "        Total Runtime: " << (total_runtime / 1000) << "ms" << std::endl;	
 }
 
 int main(int argc, char *argv[])
