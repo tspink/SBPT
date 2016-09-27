@@ -1,10 +1,16 @@
 #include "pin.H"
 
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
 #include <list>
 #include <time.h>
+
+KNOB<bool> KnobTraceMemory(KNOB_MODE_WRITEONCE, "pintool", "trace_mem", "0", "Should trace memory");
+KNOB<string> KnobTraceFile(KNOB_MODE_WRITEONCE, "pintool", "trace_file", "trace.bin", "Trace file");
 
 static uint64_t now()
 {
@@ -13,6 +19,12 @@ static uint64_t now()
 	
 	return tv.tv_sec * 1e6 + tv.tv_usec;
 }
+
+struct MemoryAccess
+{
+	uint64_t Address;
+	bool Read;
+};
 
 struct KernelDescriptor
 {
@@ -30,11 +42,14 @@ struct KernelInvocation
 	
 	KernelDescriptor *Descriptor;
 	uint64_t Duration;
+	
+	std::list<MemoryAccess> MemoryAccessTrace;
 };
 
 struct FrameDescriptor
 {
 	std::list<KernelInvocation *> KernelInvocations;
+	uint32_t Index;
 	uint64_t Duration;
 };
 
@@ -45,17 +60,67 @@ static FrameDescriptor *CurrentFrame;
 static KernelInvocation *CurrentKernel;
 static int NextKernelID;
 
+static int LogFD, CurrentFrameIndex;
+
+#define LOG_PACKET_FRAME_START	0
+#define LOG_PACKET_FRAME_END	1
+#define LOG_PACKET_KERNEL_START	2
+#define LOG_PACKET_KERNEL_END	3
+#define LOG_PACKET_MEM_READ		4
+#define LOG_PACKET_MEM_WRITE	5
+
+struct LogFramePacket
+{
+	uint8_t type;
+	uint64_t time;
+	uint32_t index;
+} __attribute__((packed));
+
+struct LogKernelPacket
+{
+	uint8_t type;
+	uint64_t time;
+	uint32_t kernel;
+} __attribute__((packed));
+
+struct LogMemPacket
+{
+	uint8_t type;
+	uint64_t time;
+	uint64_t address;
+} __attribute__((packed));
+
+static uint64_t CurrentTime()
+{
+	return 0;
+}
+
 void FrameStart()
 {
 	ASSERT(!CurrentFrame, "A frame is already in progress");
 	
 	CurrentFrame = new FrameDescriptor();
+	CurrentFrame->Index = CurrentFrameIndex++;
 	CurrentFrame->Duration = now();
+	
+	LogFramePacket lfp;
+	lfp.type = LOG_PACKET_FRAME_START;
+	lfp.time = CurrentTime();
+	lfp.index = CurrentFrame->Index;
+	
+	write(LogFD, &lfp, sizeof(lfp));
 }
 
 void FrameEnd()
 {
 	ASSERT(CurrentFrame, "A frame is not in progress");
+	
+	LogFramePacket lfp;
+	lfp.type = LOG_PACKET_FRAME_END;
+	lfp.time = CurrentTime();
+	lfp.index = CurrentFrame->Index;
+	
+	write(LogFD, &lfp, sizeof(lfp));
 	
 	CurrentFrame->Duration = now() - CurrentFrame->Duration;
 	
@@ -70,12 +135,26 @@ void KernelRoutineEnter(KernelDescriptor *descriptor)
 
 	CurrentKernel = new KernelInvocation(descriptor);
 	CurrentKernel->Duration = now();
+	
+	LogKernelPacket lfp;
+	lfp.type = LOG_PACKET_KERNEL_START;
+	lfp.time = CurrentTime();
+	lfp.kernel = descriptor->ID;
+	
+	write(LogFD, &lfp, sizeof(lfp));
 }
 
 void KernelRoutineExit(KernelDescriptor *descriptor)
 {
 	ASSERT(CurrentFrame, "A frame is not in progress");
 	ASSERT(CurrentKernel, "A kernel is not in progress");
+	
+	LogKernelPacket lfp;
+	lfp.type = LOG_PACKET_KERNEL_END;
+	lfp.time = CurrentTime();
+	lfp.kernel = descriptor->ID;
+	
+	write(LogFD, &lfp, sizeof(lfp));
 	
 	CurrentKernel->Duration = now() - CurrentKernel->Duration;
 	CurrentFrame->KernelInvocations.push_back(CurrentKernel);
@@ -85,7 +164,27 @@ void KernelRoutineExit(KernelDescriptor *descriptor)
 	CurrentKernel = NULL;
 }
 
-void Routine(RTN rtn, void *v)
+void MemoryReadInstruction(void *rip, uintptr_t addr)
+{
+	LogMemPacket lmp;
+	lmp.type = LOG_PACKET_MEM_READ;
+	lmp.time = CurrentTime();
+	lmp.address = addr;
+	
+	write(LogFD, &lmp, sizeof(lmp));
+}
+
+void MemoryWriteInstruction(void *rip, uintptr_t addr)
+{	
+	LogMemPacket lmp;
+	lmp.type = LOG_PACKET_MEM_WRITE;
+	lmp.time = CurrentTime();
+	lmp.address = addr;
+	
+	write(LogFD, &lmp, sizeof(lmp));
+}
+
+void Routine(RTN rtn, VOID *v)
 {
 	// std::cerr << "Routine: " << RTN_Name(rtn) << std::endl;
 	
@@ -119,8 +218,24 @@ void Routine(RTN rtn, void *v)
 	RTN_Close(rtn);
 }
 
+void Instruction(INS ins, VOID *p)
+{
+	unsigned int operand_count = INS_MemoryOperandCount(ins);
+	for (unsigned int operand_index = 0; operand_index < operand_count; operand_index++) {
+		if (INS_MemoryOperandIsRead(ins, operand_index)) {
+			INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryReadInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_END);
+		}
+
+		if (INS_MemoryOperandIsWritten(ins, operand_index)) {
+			INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryWriteInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_END);
+		}
+	}
+}
+
 void Fini(INT32 code, void *v)
 {
+	close(LogFD);
+	
 	std::cerr << std::endl;
 	std::cerr << "*** SLAMBench Completed ***" << std::endl;
 	
@@ -214,8 +329,18 @@ int main(int argc, char *argv[])
 	}
 	
 	RTN_AddInstrumentFunction(Routine, NULL);
+	
+	if (KnobTraceMemory.Value())
+		INS_AddInstrumentFunction(Instruction, NULL);
+	
 	PIN_AddFiniFunction(Fini, NULL);
 
+	LogFD = open(KnobTraceFile.Value().c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
+	if (LogFD < 0) {
+		perror("Unable to open trace file");
+		return 1;
+	}
+	
 	PIN_StartProgram();
 	return 0;
 }
