@@ -141,7 +141,7 @@ void Fini(INT32 code, void *v)
 		
 		double runtime_average = (double)descriptor->TotalExecutionTime / descriptor->TotalExecutionCount;
 		
-		std::cerr << "Kernel: " << descriptor->Name << ":" << std::endl
+		std::cerr << "Kernel: " << descriptor->ID << ": " << descriptor->Name << ":" << std::endl
 		<< "  Execution Count: " << descriptor->TotalExecutionCount << " (" << std::setprecision(2) << (((double)descriptor->TotalExecutionCount / (double)all_kernel_executions) * 100.0) << "%) " << std::endl
 		<< "    Total Runtime: " << (descriptor->TotalExecutionTime / 1000) << "ms (" << std::setprecision(2) << (((double)descriptor->TotalExecutionTime / all_kernel_runtimes) * 100) << "%)" << std::endl
 		<< "  Average Runtime: " << std::setprecision(5) << (runtime_average / 1000) << "ms" << std::endl
@@ -165,7 +165,7 @@ void Fini(INT32 code, void *v)
 	
 	int index = 0;
 	for (auto frame : FrameDescriptors) {
-		std::cerr << "FRAME " << std::setw(3) << index++ << ": ";
+		/*std::cerr << "FRAME " << std::setw(3) << index++ << ": ";
 		
 		std::cerr << std::setw(12) << (frame->Duration / 1000);
 		
@@ -188,7 +188,16 @@ void Fini(INT32 code, void *v)
 			else std::cerr << ", ";
 			std::cerr << inv->Descriptor->ID << ":" << std::setprecision(2) << (((double)inv->Duration / frame->Duration) * 100);
 		}
-		std::cerr << "]" << std::endl;
+		std::cerr << "]" << std::endl;*/
+		
+		std::cerr << index++ << "," << frame->Duration;
+		
+		for (auto inv : frame->KernelInvocations) {
+			std::cerr << "," << inv->Duration;
+			//std::cerr << "," << inv->Descriptor->ID;
+		}
+		
+		std::cerr << std::endl;
 	}
 }
 
