@@ -8,10 +8,13 @@
 #include <fstream>
 #include <list>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <time.h>
 
 KNOB<bool> KnobTraceMemory(KNOB_MODE_WRITEONCE, "pintool", "trace_mem", "0", "Should trace memory");
+KNOB<bool> KnobTraceReuse(KNOB_MODE_WRITEONCE, "pintool", "trace_reuse", "0", "Should trace reuses");
+KNOB<bool> KnobTraceTimes(KNOB_MODE_WRITEONCE, "pintool", "trace_timing", "0", "Should trace times");
 
 static uint64_t now()
 {
@@ -53,6 +56,18 @@ struct MemoryStatistics
 	MemoryZone StackZone, HeapZone, DataZone;	
 };
 
+struct MemoryInstruction
+{
+	uint64_t RIP;
+	uint64_t LastTouch;
+};
+
+struct KernelMemoryInstruction
+{
+	uint64_t LastAddress;
+	std::set<int64_t> AddressDifferences;
+};
+
 struct KernelDescriptor
 {
 	KernelDescriptor(int _id, std::string _name) : ID(_id), Name(_name), TotalExecutionCount(0), TotalExecutionTime(0) { }
@@ -61,6 +76,8 @@ struct KernelDescriptor
 	std::string Name;
 	uint64_t TotalExecutionCount;
 	uint64_t TotalExecutionTime;
+	
+	std::unordered_map<uintptr_t, KernelMemoryInstruction *> MemoryInstructions;
 };
 
 struct KernelInvocation
@@ -144,27 +161,43 @@ void KernelRoutineExit(KernelDescriptor *descriptor)
 static uintptr_t ReuseQueue[4096];
 static uint64_t ReuseQueueSize, LastTimepoint;
 
-void MemoryAccessCommon(uintptr_t addr, MemoryZone& zone)
+void MemoryAccessCommon(uintptr_t addr, MemoryZone& zone, MemoryInstruction& mi)
 {
-	bool found = false;
-	unsigned int index;
-	for (index = 0; index < ReuseQueueSize; index++) {
-		if (ReuseQueue[index] == addr) {
-			found = true;
-			break;
-		}
-	}
+	mi.LastTouch = zone.TotalReads + zone.TotalWrites;
 	
-	if (found) {
-		uint64_t distance = ReuseQueueSize - index;
-		if (distance > zone.MaxReuseDistance)
-			zone.MaxReuseDistance = distance;
+	if (CurrentKernel) {
+		auto& kmi = CurrentKernel->Descriptor->MemoryInstructions[(uintptr_t)&mi];		
+		if (!kmi) kmi = new KernelMemoryInstruction();
 
-		zone.AverageReuseDistance.Add(distance);
-		ReuseQueueSize = 0;
-	} else {
-		ReuseQueue[ReuseQueueSize++] = addr;
-		if (ReuseQueueSize >= 4096) ReuseQueueSize = 0;
+		if (kmi->LastAddress) {
+			int64_t delta = (int64_t)addr - (int64_t)kmi->LastAddress;
+			kmi->AddressDifferences.insert(delta);
+		}
+		
+		kmi->LastAddress = addr;
+	}
+		
+	if (KnobTraceReuse.Value()) {
+		bool found = false;
+		unsigned int index;
+		for (index = 0; index < ReuseQueueSize; index++) {
+			if (ReuseQueue[index] == addr) {
+				found = true;
+				break;
+			}
+		}
+
+		if (found) {
+			uint64_t distance = ReuseQueueSize - index;
+			if (distance > zone.MaxReuseDistance)
+				zone.MaxReuseDistance = distance;
+
+			zone.AverageReuseDistance.Add(distance);
+			ReuseQueueSize = 0;
+		} else {
+			ReuseQueue[ReuseQueueSize++] = addr;
+			if (ReuseQueueSize >= 4096) ReuseQueueSize = 0;
+		}
 	}
 	
 	zone.AddressAccesses[addr]++;
@@ -192,25 +225,27 @@ static inline MemoryZone& ClassifyAddress(uintptr_t addr)
 	}
 }
 
-void MemoryReadInstruction(void *rip, uintptr_t addr)
+void MemoryReadInstruction(void *rip, uintptr_t addr, MemoryInstruction *mi)
 {
 	MemoryZone& zone = ClassifyAddress(addr);
 	
 	zone.TotalReads++;
 	zone.AddressReads[addr]++;
 	
-	MemoryAccessCommon(addr, zone);
+	MemoryAccessCommon(addr, zone, *mi);
 }
 
-void MemoryWriteInstruction(void *rip, uintptr_t addr)
+void MemoryWriteInstruction(void *rip, uintptr_t addr, MemoryInstruction *mi)
 {
 	MemoryZone& zone = ClassifyAddress(addr);
 	
 	zone.TotalWrites++;
 	zone.AddressWrites[addr]++;
 	
-	MemoryAccessCommon(addr, zone);
+	MemoryAccessCommon(addr, zone, *mi);
 }
+
+std::map<std::string, std::string> KernelNameMap;
 
 void Routine(RTN rtn, VOID *v)
 {
@@ -237,7 +272,16 @@ void Routine(RTN rtn, VOID *v)
 	
 	std::cerr << "Identified kernel routine: " << RTN_Name(rtn) << std::endl;
 	
-	KernelDescriptor *descriptor = new KernelDescriptor(NextKernelID++, RTN_Name(rtn));
+	std::string name;
+	
+	auto friendly = KernelNameMap.find(RTN_Name(rtn));
+	if (friendly == KernelNameMap.end()) {
+		name = RTN_Name(rtn);
+	} else {
+		name = friendly->second;
+	}
+	
+	KernelDescriptor *descriptor = new KernelDescriptor(NextKernelID++, name);
 	KernelDescriptors.push_back(descriptor);
 	
 	RTN_Open(rtn);
@@ -249,13 +293,19 @@ void Routine(RTN rtn, VOID *v)
 void Instruction(INS ins, VOID *p)
 {
 	unsigned int operand_count = INS_MemoryOperandCount(ins);
-	for (unsigned int operand_index = 0; operand_index < operand_count; operand_index++) {
-		if (INS_MemoryOperandIsRead(ins, operand_index)) {
-			INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryReadInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_END);
-		}
+	if (operand_count > 0) {
+		MemoryInstruction *mi = new MemoryInstruction();
+		mi->RIP = INS_Address(ins);
+		mi->LastTouch = 0;
+		
+		for (unsigned int operand_index = 0; operand_index < operand_count; operand_index++) {
+			if (INS_MemoryOperandIsRead(ins, operand_index)) {
+				INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryReadInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_PTR, (VOID *)mi, IARG_END);
+			}
 
-		if (INS_MemoryOperandIsWritten(ins, operand_index)) {
-			INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryWriteInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_END);
+			if (INS_MemoryOperandIsWritten(ins, operand_index)) {
+				INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryWriteInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_PTR, (VOID *)mi, IARG_END);
+			}
 		}
 	}
 }
@@ -264,6 +314,36 @@ void Fini(INT32 code, void *v)
 {
 	std::cerr << std::endl;
 	std::cerr << "*** SLAMBench Completed ***" << std::endl;
+	
+	for (auto descriptor : KernelDescriptors) {
+		std::cerr << "Kernel: " << descriptor->Name << std::endl;
+		
+		if (descriptor->MemoryInstructions.size() > 0) {
+			std::set<int64_t> strides;
+			
+			uint64_t nr_one_stride = 0, nr_two_stride = 0;
+			for (auto mi : descriptor->MemoryInstructions) {
+				for (auto stride : mi.second->AddressDifferences) {
+					strides.insert(stride);
+				}
+				
+				uint64_t unique_strides = mi.second->AddressDifferences.size();
+				if (unique_strides == 1) {
+					nr_one_stride++;
+				} else if (unique_strides == 2) {
+					nr_two_stride++;
+				}
+			}
+
+			std::cerr << "  % of memory instructions with only one unique stride: " << ((nr_one_stride * 100)/descriptor->MemoryInstructions.size()) << std::endl;
+			std::cerr << "      % of memory instructions with two unique strides: " << ((nr_two_stride * 100)/descriptor->MemoryInstructions.size()) << std::endl;
+			/*std::cerr << " Seen strides:";
+			for (auto stride : strides) {
+				std::cerr << " " << stride;
+			}
+			std::cerr << std::endl;*/
+		}
+	}
 	
 	std::cerr << "Memory Statistics:" << std::endl;
 	
@@ -280,7 +360,7 @@ void Fini(INT32 code, void *v)
 	}
 
 	std::cerr << "         Average Reuse: " << zone1.AverageReuse.Value << std::endl << std::endl;
-
+	
 	MemoryZone& zone2 = MemoryStats.StackZone;
 	std::cerr << "*** STACK ***" << std::endl;
 	std::cerr << "        Total Accesses: Reads=" << zone2.TotalReads << ", Writes=" << zone2.TotalWrites << ", Total=" << (zone2.TotalReads + zone2.TotalWrites) << std::endl;
@@ -294,7 +374,7 @@ void Fini(INT32 code, void *v)
 	}
 
 	std::cerr << "         Average Reuse: " << zone2.AverageReuse.Value << std::endl << std::endl;
-
+	
 	MemoryZone& zone3 = MemoryStats.HeapZone;
 	std::cerr << "*** HEAP ***" << std::endl;
 	std::cerr << "        Total Accesses: Reads=" << zone3.TotalReads << ", Writes=" << zone3.TotalWrites << ", Total=" << (zone3.TotalReads + zone3.TotalWrites) << std::endl;
@@ -309,83 +389,83 @@ void Fini(INT32 code, void *v)
 
 	std::cerr << "         Average Reuse: " << zone3.AverageReuse.Value << std::endl << std::endl;
 	
-#if 0
-	uint64_t all_kernel_executions = 0;
-	for (auto descriptor : KernelDescriptors) {
-		all_kernel_executions += descriptor->TotalExecutionCount;
-	}
+	if (KnobTraceTimes.Value()) {
+		uint64_t all_kernel_executions = 0;
+		for (auto descriptor : KernelDescriptors) {
+			all_kernel_executions += descriptor->TotalExecutionCount;
+		}
 
-	uint64_t all_kernel_runtimes = 0;
-	for (auto descriptor : KernelDescriptors) {
-		all_kernel_runtimes += descriptor->TotalExecutionTime;
-	}
-	
-	for (auto descriptor : KernelDescriptors) {
-		if (descriptor->TotalExecutionCount == 0) continue;
-		
-		all_kernel_runtimes += descriptor->TotalExecutionTime;
-		
-		double runtime_average = (double)descriptor->TotalExecutionTime / descriptor->TotalExecutionCount;
-		
-		std::cerr << "Kernel: " << descriptor->ID << ": " << descriptor->Name << ":" << std::endl
-		<< "  Execution Count: " << descriptor->TotalExecutionCount << " (" << std::setprecision(2) << (((double)descriptor->TotalExecutionCount / (double)all_kernel_executions) * 100.0) << "%) " << std::endl
-		<< "    Total Runtime: " << (descriptor->TotalExecutionTime / 1000) << "ms (" << std::setprecision(2) << (((double)descriptor->TotalExecutionTime / all_kernel_runtimes) * 100) << "%)" << std::endl
-		<< "  Average Runtime: " << std::setprecision(5) << (runtime_average / 1000) << "ms" << std::endl
-		<< std::endl;
-	}
-	
-	std::cerr << "Total Execution Count: " << all_kernel_executions << std::endl
-			  << "        Total Runtime: " << (all_kernel_runtimes / 1000) << "ms" << std::endl;
-	
-	std::cerr << std::endl;
-	
-	std::cerr << "Total Frames: " << FrameDescriptors.size() << std::endl;
-	
-	uint64_t all_frame_times = 0;
-	for (auto frame : FrameDescriptors) {
-		all_frame_times += frame->Duration;
-	}
-	
-	std::cerr << "Average Frame Duration: " << (((double)all_frame_times /  FrameDescriptors.size()) / 1000) << "ms" << std::endl;
-	std::cerr << "Average Throughput: " << ((double)FrameDescriptors.size() / (all_frame_times / 1e6)) << " FPS" << std::endl;
-	
-	int index = 0;
-	for (auto frame : FrameDescriptors) {
-		/*std::cerr << "FRAME " << std::setw(3) << index++ << ": ";
-		
-		std::cerr << std::setw(12) << (frame->Duration / 1000);
-		
-		std::cerr << " [";
-		
-		bool first = true;
-		for (auto inv : frame->KernelInvocations) {
-			if (first) first = false;
-			else std::cerr << ", ";
-			
-			std::cerr << inv->Descriptor->ID << ":" << inv->Duration;
+		uint64_t all_kernel_runtimes = 0;
+		for (auto descriptor : KernelDescriptors) {
+			all_kernel_runtimes += descriptor->TotalExecutionTime;
 		}
-		
-		std::cerr << "]" << std::endl;
-		
-		std::cerr << "REL [";
-		first = true;
-		for (auto inv : frame->KernelInvocations) {
-			if (first) first = false;
-			else std::cerr << ", ";
-			std::cerr << inv->Descriptor->ID << ":" << std::setprecision(2) << (((double)inv->Duration / frame->Duration) * 100);
+
+		for (auto descriptor : KernelDescriptors) {
+			if (descriptor->TotalExecutionCount == 0) continue;
+
+			all_kernel_runtimes += descriptor->TotalExecutionTime;
+
+			double runtime_average = (double)descriptor->TotalExecutionTime / descriptor->TotalExecutionCount;
+
+			std::cerr << "Kernel: " << descriptor->ID << ": " << descriptor->Name << ":" << std::endl
+			<< "  Execution Count: " << descriptor->TotalExecutionCount << " (" << std::setprecision(2) << (((double)descriptor->TotalExecutionCount / (double)all_kernel_executions) * 100.0) << "%) " << std::endl
+			<< "    Total Runtime: " << (descriptor->TotalExecutionTime / 1000) << "ms (" << std::setprecision(2) << (((double)descriptor->TotalExecutionTime / all_kernel_runtimes) * 100) << "%)" << std::endl
+			<< "  Average Runtime: " << std::setprecision(5) << (runtime_average / 1000) << "ms" << std::endl
+			<< std::endl;
 		}
-		std::cerr << "]" << std::endl;*/
-		
-		std::cerr << index++ << "," << frame->Duration;
-		
-		for (auto inv : frame->KernelInvocations) {
-			std::cerr << "," << inv->Duration;
-			//std::cerr << "," << inv->Descriptor->ID;
-		}
-		
+
+		std::cerr << "Total Execution Count: " << all_kernel_executions << std::endl
+				  << "        Total Runtime: " << (all_kernel_runtimes / 1000) << "ms" << std::endl;
+
 		std::cerr << std::endl;
+
+		std::cerr << "Total Frames: " << FrameDescriptors.size() << std::endl;
+
+		uint64_t all_frame_times = 0;
+		for (auto frame : FrameDescriptors) {
+			all_frame_times += frame->Duration;
+		}
+
+		std::cerr << "Average Frame Duration: " << (((double)all_frame_times /  FrameDescriptors.size()) / 1000) << "ms" << std::endl;
+		std::cerr << "Average Throughput: " << ((double)FrameDescriptors.size() / (all_frame_times / 1e6)) << " FPS" << std::endl;
+
+		int index = 0;
+		for (auto frame : FrameDescriptors) {
+			/*std::cerr << "FRAME " << std::setw(3) << index++ << ": ";
+
+			std::cerr << std::setw(12) << (frame->Duration / 1000);
+
+			std::cerr << " [";
+
+			bool first = true;
+			for (auto inv : frame->KernelInvocations) {
+				if (first) first = false;
+				else std::cerr << ", ";
+
+				std::cerr << inv->Descriptor->ID << ":" << inv->Duration;
+			}
+
+			std::cerr << "]" << std::endl;
+
+			std::cerr << "REL [";
+			first = true;
+			for (auto inv : frame->KernelInvocations) {
+				if (first) first = false;
+				else std::cerr << ", ";
+				std::cerr << inv->Descriptor->ID << ":" << std::setprecision(2) << (((double)inv->Duration / frame->Duration) * 100);
+			}
+			std::cerr << "]" << std::endl;*/
+
+			std::cerr << index++ << "," << frame->Duration;
+
+			for (auto inv : frame->KernelInvocations) {
+				std::cerr << "," << inv->Duration;
+				//std::cerr << "," << inv->Descriptor->ID;
+			}
+
+			std::cerr << std::endl;
+		}
 	}
-#endif
 }
 
 static void FindStack()
@@ -479,6 +559,25 @@ void Image(IMG img, VOID *v)
 //	fclose(maps);
 //}
 
+static void LoadFriendlyNames()
+{
+	KernelNameMap["_Z21bilateralFilterKernelPfPKf23__device_builtin__uint2S1_fi"] = "Bilateral Filter";
+	KernelNameMap["_Z18depth2vertexKernelP24__device_builtin__float3PKf23__device_builtin__uint28sMatrix4"] = "Depth2Vertex";
+	KernelNameMap["_Z19vertex2normalKernelP24__device_builtin__float3PKS_23__device_builtin__uint2"] = "Vertex2Normal";
+	KernelNameMap["_Z12reduceKernelPfP9TrackData23__device_builtin__uint2S2_"] = "Reduce";
+	KernelNameMap["_Z11trackKernelP9TrackDataPK24__device_builtin__float3S3_23__device_builtin__uint2S3_S3_S4_8sMatrix4S5_ff"] = "Track";
+	KernelNameMap["_Z15mm2metersKernelPf23__device_builtin__uint2PKtS0_"] = "mm2m";
+	KernelNameMap["_Z27halfSampleRobustImageKernelPfPKf23__device_builtin__uint2fi"] = "HalfSampleRobustImage";
+	KernelNameMap["_Z15integrateKernel6VolumePKf23__device_builtin__uint28sMatrix4S3_ff"] = "Integrate";
+	KernelNameMap["_Z13raycastKernelP24__device_builtin__float3S0_23__device_builtin__uint26Volume8sMatrix4ffff"] = "Raycast";
+	KernelNameMap["_Z15checkPoseKernelR8sMatrix4S_PKf23__device_builtin__uint2f"] = "CheckPose";
+	KernelNameMap["_Z18renderNormalKernelP24__device_builtin__uchar3PK24__device_builtin__float323__device_builtin__uint2"] = "RenderNormal";
+	KernelNameMap["_Z17renderDepthKernelP24__device_builtin__uchar4Pf23__device_builtin__uint2ff"] = "RenderDepth";
+	KernelNameMap["_Z17renderTrackKernelP24__device_builtin__uchar4PK9TrackData23__device_builtin__uint2"] = "RenderTrack";
+	KernelNameMap["_Z18renderVolumeKernelP24__device_builtin__uchar423__device_builtin__uint26Volume8sMatrix4ffff24__device_builtin__float3S4_"] = "RenderVolume";
+	KernelNameMap["_Z16updatePoseKernelR8sMatrix4PKff"] = "UpdatePose";
+}
+
 int main(int argc, char *argv[])
 {
 	PIN_InitSymbols();
@@ -490,6 +589,8 @@ int main(int argc, char *argv[])
 
 		return 1;
 	}
+	
+	LoadFriendlyNames();
 	
 	IMG_AddInstrumentFunction(Image, NULL);
 	
