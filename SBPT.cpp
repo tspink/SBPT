@@ -15,6 +15,7 @@
 KNOB<bool> KnobTraceMemory(KNOB_MODE_WRITEONCE, "pintool", "trace_mem", "0", "Should trace memory");
 KNOB<bool> KnobTraceReuse(KNOB_MODE_WRITEONCE, "pintool", "trace_reuse", "0", "Should trace reuses");
 KNOB<bool> KnobTraceTimes(KNOB_MODE_WRITEONCE, "pintool", "trace_timing", "0", "Should trace times");
+KNOB<bool> KnobTraceKInst(KNOB_MODE_WRITEONCE, "pintool", "trace_kinst", "0", "Should trace kernel instructions");
 
 static uint64_t now()
 {
@@ -80,12 +81,20 @@ struct KernelDescriptor
 	std::unordered_map<uintptr_t, KernelMemoryInstruction *> MemoryInstructions;
 };
 
+struct InstructionExecution
+{
+	uint64_t RIP;
+	uint32_t Opcode;
+};
+
 struct KernelInvocation
 {
 	KernelInvocation(KernelDescriptor *descriptor) : Descriptor(descriptor), Duration(0) { }
 	
 	KernelDescriptor *Descriptor;
 	uint64_t Duration;
+	
+	std::list<InstructionExecution *> Instructions;
 };
 
 struct FrameDescriptor
@@ -117,6 +126,10 @@ static int NextKernelID;
 
 static int CurrentFrameIndex;
 
+#include "trace-packet.h"
+
+FILE *TraceFile;
+
 void FrameStart()
 {
 	ASSERT(!CurrentFrame, "A frame is already in progress");
@@ -124,6 +137,12 @@ void FrameStart()
 	CurrentFrame = new FrameDescriptor();
 	CurrentFrame->Index = CurrentFrameIndex++;
 	CurrentFrame->Duration = now();
+	
+	if (TraceFile) {
+		FrameTracePacket ftp;
+		ftp.Type = TRACE_PACKET_FRAME_START;
+		fwrite(&ftp, sizeof(ftp), 1, TraceFile);
+	}
 }
 
 void FrameEnd()
@@ -134,6 +153,12 @@ void FrameEnd()
 	
 	FrameDescriptors.push_back(CurrentFrame);
 	CurrentFrame = NULL;
+	
+	if (TraceFile) {
+		FrameTracePacket ftp;
+		ftp.Type = TRACE_PACKET_FRAME_END;
+		fwrite(&ftp, sizeof(ftp), 1, TraceFile);
+	}
 }
 
 void KernelRoutineEnter(KernelDescriptor *descriptor)
@@ -143,6 +168,13 @@ void KernelRoutineEnter(KernelDescriptor *descriptor)
 
 	CurrentKernel = new KernelInvocation(descriptor);
 	CurrentKernel->Duration = now();
+	
+	if (TraceFile) {
+		KernelTracePacket ktp;
+		ktp.Type = TRACE_PACKET_KERNEL_START;
+		ktp.ID = CurrentKernel->Descriptor->ID;
+		fwrite(&ktp, sizeof(ktp), 1, TraceFile);
+	}
 }
 
 void KernelRoutineExit(KernelDescriptor *descriptor)
@@ -153,9 +185,16 @@ void KernelRoutineExit(KernelDescriptor *descriptor)
 	CurrentKernel->Duration = now() - CurrentKernel->Duration;
 	CurrentFrame->KernelInvocations.push_back(CurrentKernel);
 	
+	if (TraceFile) {
+		KernelTracePacket ktp;
+		ktp.Type = TRACE_PACKET_KERNEL_END;
+		ktp.ID = CurrentKernel->Descriptor->ID;
+		fwrite(&ktp, sizeof(ktp), 1, TraceFile);
+	}
+	
 	CurrentKernel->Descriptor->TotalExecutionCount++;
 	CurrentKernel->Descriptor->TotalExecutionTime += CurrentKernel->Duration;
-	CurrentKernel = NULL;
+	CurrentKernel = NULL;	
 }
 
 static uintptr_t ReuseQueue[4096];
@@ -245,6 +284,20 @@ void MemoryWriteInstruction(void *rip, uintptr_t addr, MemoryInstruction *mi)
 	MemoryAccessCommon(addr, zone, *mi);
 }
 
+void InstructionExecuted(VOID *rip, uint32_t opcode)
+{
+	if (!CurrentKernel) return;
+	
+	if (TraceFile) {
+		InstructionTracePacket itp;
+		itp.Type = TRACE_PACKET_INSTRUCTION;
+		itp.Opcode = opcode;
+		itp.RIP = (uint64_t)rip;
+	
+		fwrite(&itp, sizeof(InstructionTracePacket), 1, TraceFile);
+	}
+}
+
 std::map<std::string, std::string> KernelNameMap;
 
 void Routine(RTN rtn, VOID *v)
@@ -292,102 +345,117 @@ void Routine(RTN rtn, VOID *v)
 
 void Instruction(INS ins, VOID *p)
 {
-	unsigned int operand_count = INS_MemoryOperandCount(ins);
-	if (operand_count > 0) {
-		MemoryInstruction *mi = new MemoryInstruction();
-		mi->RIP = INS_Address(ins);
-		mi->LastTouch = 0;
-		
-		for (unsigned int operand_index = 0; operand_index < operand_count; operand_index++) {
-			if (INS_MemoryOperandIsRead(ins, operand_index)) {
-				INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryReadInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_PTR, (VOID *)mi, IARG_END);
-			}
+	if (KnobTraceMemory.Value()) {
+		unsigned int operand_count = INS_MemoryOperandCount(ins);
+		if (operand_count > 0) {
+			MemoryInstruction *mi = new MemoryInstruction();
+			mi->RIP = INS_Address(ins);
+			mi->LastTouch = 0;
 
-			if (INS_MemoryOperandIsWritten(ins, operand_index)) {
-				INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryWriteInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_PTR, (VOID *)mi, IARG_END);
+			for (unsigned int operand_index = 0; operand_index < operand_count; operand_index++) {
+				if (INS_MemoryOperandIsRead(ins, operand_index)) {
+					INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryReadInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_PTR, (VOID *)mi, IARG_END);
+				}
+
+				if (INS_MemoryOperandIsWritten(ins, operand_index)) {
+					INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryWriteInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_PTR, (VOID *)mi, IARG_END);
+				}
 			}
 		}
+	}
+	
+	if (KnobTraceKInst.Value()) {
+		/*RTN parent = INS_Rtn(ins);
+		SEC parent_section = RTN_Sec(parent);
+		if (SEC_Name(parent_section) == ".kernel") {*/
+			INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InstructionExecuted, IARG_INST_PTR, IARG_END);
+		//}
 	}
 }
 
 void Fini(INT32 code, void *v)
 {
+	if (TraceFile)
+		fclose(TraceFile);
+	
 	std::cerr << std::endl;
 	std::cerr << "*** SLAMBench Completed ***" << std::endl;
 	
-	for (auto descriptor : KernelDescriptors) {
-		std::cerr << "Kernel: " << descriptor->Name << std::endl;
-		
-		if (descriptor->MemoryInstructions.size() > 0) {
-			std::set<int64_t> strides;
-			
-			uint64_t nr_one_stride = 0, nr_two_stride = 0;
-			for (auto mi : descriptor->MemoryInstructions) {
-				for (auto stride : mi.second->AddressDifferences) {
-					strides.insert(stride);
-				}
-				
-				uint64_t unique_strides = mi.second->AddressDifferences.size();
-				if (unique_strides == 1) {
-					nr_one_stride++;
-				} else if (unique_strides == 2) {
-					nr_two_stride++;
-				}
-			}
+	if (KnobTraceMemory.Value()) {
+		for (auto descriptor : KernelDescriptors) {
+			std::cerr << "Kernel: " << descriptor->Name << std::endl;
 
-			std::cerr << "  % of memory instructions with only one unique stride: " << ((nr_one_stride * 100)/descriptor->MemoryInstructions.size()) << std::endl;
-			std::cerr << "      % of memory instructions with two unique strides: " << ((nr_two_stride * 100)/descriptor->MemoryInstructions.size()) << std::endl;
-			/*std::cerr << " Seen strides:";
-			for (auto stride : strides) {
-				std::cerr << " " << stride;
+			if (descriptor->MemoryInstructions.size() > 0) {
+				std::set<int64_t> strides;
+
+				uint64_t nr_one_stride = 0, nr_two_stride = 0;
+				for (auto mi : descriptor->MemoryInstructions) {
+					for (auto stride : mi.second->AddressDifferences) {
+						strides.insert(stride);
+					}
+
+					uint64_t unique_strides = mi.second->AddressDifferences.size();
+					if (unique_strides == 1) {
+						nr_one_stride++;
+					} else if (unique_strides == 2) {
+						nr_two_stride++;
+					}
+				}
+
+				std::cerr << "  % of memory instructions with only one unique stride: " << ((nr_one_stride * 100)/descriptor->MemoryInstructions.size()) << std::endl;
+				std::cerr << "      % of memory instructions with two unique strides: " << ((nr_two_stride * 100)/descriptor->MemoryInstructions.size()) << std::endl;
+				/*std::cerr << " Seen strides:";
+				for (auto stride : strides) {
+					std::cerr << " " << stride;
+				}
+				std::cerr << std::endl;*/
 			}
-			std::cerr << std::endl;*/
 		}
+	
+		std::cerr << "Memory Statistics:" << std::endl;
+
+		MemoryZone& zone1 = MemoryStats.DataZone;
+		std::cerr << "*** DATA ***" << std::dec << std::endl;
+		std::cerr << "        Total Accesses: Reads=" << zone1.TotalReads << ", Writes=" << zone1.TotalWrites << ", Total=" << (zone1.TotalReads + zone1.TotalWrites) << std::endl;
+		std::cerr << "     Distinct Accesses: Reads=" << zone1.AddressReads.size() << ", Writes=" << zone1.AddressWrites.size() << ", Total=" << (zone1.AddressReads.size() + zone1.AddressWrites.size()) << std::endl;
+
+		std::cerr << "Average Reuse Distance: " << zone1.AverageReuseDistance.Value << std::endl;
+		std::cerr << "   Max. Reuse Distance: " << zone1.MaxReuseDistance << std::endl;
+
+		for (auto access : zone1.AddressAccesses) {
+			zone1.AverageReuse.Add(access.second);
+		}
+
+		std::cerr << "         Average Reuse: " << zone1.AverageReuse.Value << std::endl << std::endl;
+
+		MemoryZone& zone2 = MemoryStats.StackZone;
+		std::cerr << "*** STACK ***" << std::endl;
+		std::cerr << "        Total Accesses: Reads=" << zone2.TotalReads << ", Writes=" << zone2.TotalWrites << ", Total=" << (zone2.TotalReads + zone2.TotalWrites) << std::endl;
+		std::cerr << "     Distinct Accesses: Reads=" << zone2.AddressReads.size() << ", Writes=" << zone2.AddressWrites.size() << ", Total=" << (zone2.AddressReads.size() + zone2.AddressWrites.size()) << std::endl;
+
+		std::cerr << "Average Reuse Distance: " << zone2.AverageReuseDistance.Value << std::endl;
+		std::cerr << "   Max. Reuse Distance: " << zone2.MaxReuseDistance << std::endl;
+
+		for (auto access : zone2.AddressAccesses) {
+			zone2.AverageReuse.Add(access.second);
+		}
+
+		std::cerr << "         Average Reuse: " << zone2.AverageReuse.Value << std::endl << std::endl;
+
+		MemoryZone& zone3 = MemoryStats.HeapZone;
+		std::cerr << "*** HEAP ***" << std::endl;
+		std::cerr << "        Total Accesses: Reads=" << zone3.TotalReads << ", Writes=" << zone3.TotalWrites << ", Total=" << (zone3.TotalReads + zone3.TotalWrites) << std::endl;
+		std::cerr << "     Distinct Accesses: Reads=" << zone3.AddressReads.size() << ", Writes=" << zone3.AddressWrites.size() << ", Total=" << (zone3.AddressReads.size() + zone3.AddressWrites.size()) << std::endl;
+
+		std::cerr << "Average Reuse Distance: " << zone3.AverageReuseDistance.Value << std::endl;
+		std::cerr << "   Max. Reuse Distance: " << zone3.MaxReuseDistance << std::endl;
+
+		for (auto access : zone3.AddressAccesses) {
+			zone3.AverageReuse.Add(access.second);
+		}
+
+		std::cerr << "         Average Reuse: " << zone3.AverageReuse.Value << std::endl << std::endl;
 	}
-	
-	std::cerr << "Memory Statistics:" << std::endl;
-	
-	MemoryZone& zone1 = MemoryStats.DataZone;
-	std::cerr << "*** DATA ***" << std::dec << std::endl;
-	std::cerr << "        Total Accesses: Reads=" << zone1.TotalReads << ", Writes=" << zone1.TotalWrites << ", Total=" << (zone1.TotalReads + zone1.TotalWrites) << std::endl;
-	std::cerr << "     Distinct Accesses: Reads=" << zone1.AddressReads.size() << ", Writes=" << zone1.AddressWrites.size() << ", Total=" << (zone1.AddressReads.size() + zone1.AddressWrites.size()) << std::endl;
-	
-	std::cerr << "Average Reuse Distance: " << zone1.AverageReuseDistance.Value << std::endl;
-	std::cerr << "   Max. Reuse Distance: " << zone1.MaxReuseDistance << std::endl;
-
-	for (auto access : zone1.AddressAccesses) {
-		zone1.AverageReuse.Add(access.second);
-	}
-
-	std::cerr << "         Average Reuse: " << zone1.AverageReuse.Value << std::endl << std::endl;
-	
-	MemoryZone& zone2 = MemoryStats.StackZone;
-	std::cerr << "*** STACK ***" << std::endl;
-	std::cerr << "        Total Accesses: Reads=" << zone2.TotalReads << ", Writes=" << zone2.TotalWrites << ", Total=" << (zone2.TotalReads + zone2.TotalWrites) << std::endl;
-	std::cerr << "     Distinct Accesses: Reads=" << zone2.AddressReads.size() << ", Writes=" << zone2.AddressWrites.size() << ", Total=" << (zone2.AddressReads.size() + zone2.AddressWrites.size()) << std::endl;
-	
-	std::cerr << "Average Reuse Distance: " << zone2.AverageReuseDistance.Value << std::endl;
-	std::cerr << "   Max. Reuse Distance: " << zone2.MaxReuseDistance << std::endl;
-
-	for (auto access : zone2.AddressAccesses) {
-		zone2.AverageReuse.Add(access.second);
-	}
-
-	std::cerr << "         Average Reuse: " << zone2.AverageReuse.Value << std::endl << std::endl;
-	
-	MemoryZone& zone3 = MemoryStats.HeapZone;
-	std::cerr << "*** HEAP ***" << std::endl;
-	std::cerr << "        Total Accesses: Reads=" << zone3.TotalReads << ", Writes=" << zone3.TotalWrites << ", Total=" << (zone3.TotalReads + zone3.TotalWrites) << std::endl;
-	std::cerr << "     Distinct Accesses: Reads=" << zone3.AddressReads.size() << ", Writes=" << zone3.AddressWrites.size() << ", Total=" << (zone3.AddressReads.size() + zone3.AddressWrites.size()) << std::endl;
-	
-	std::cerr << "Average Reuse Distance: " << zone3.AverageReuseDistance.Value << std::endl;
-	std::cerr << "   Max. Reuse Distance: " << zone3.MaxReuseDistance << std::endl;
-
-	for (auto access : zone3.AddressAccesses) {
-		zone3.AverageReuse.Add(access.second);
-	}
-
-	std::cerr << "         Average Reuse: " << zone3.AverageReuse.Value << std::endl << std::endl;
 	
 	if (KnobTraceTimes.Value()) {
 		uint64_t all_kernel_executions = 0;
@@ -517,48 +585,6 @@ void Image(IMG img, VOID *v)
 	FindStack();
 }
 
-//static void LoadVMAs()
-//{
-//	FILE *maps = fopen("/proc/self/maps", "rt");
-//	if (!maps) {
-//		return;
-//	}
-//
-//	uint64_t rsp;
-//	asm volatile("mov %%rsp, %0" : "=r"(rsp));
-//
-//	while (!feof(maps)) {
-//		char buffer[512];
-//		fgets(buffer, sizeof(buffer) - 1, maps);
-//
-//		VMA vma;
-//		sscanf(buffer, "%lx-%lx", &vma.Start, &vma.End);
-//
-//		if (strstr(buffer, "[stack]")) {
-//			vma.Type = 0;
-//		} else if (strstr(buffer, "[heap]")) {
-//			vma.Type = 1;
-//		} else {
-//			vma.Type = 2;
-//		}
-//
-//		if (rsp >= vma.Start && rsp < vma.End) {
-//			vma.Type = 0;
-//		}
-//
-//		VMAs[vma.Start] = vma;
-//
-//		fprintf(stderr, "MAP: %s", buffer);
-//		//fprintf(stderr, "Adding VMA %lx -- %lx (%d)\n", vma.Start, vma.End, vma.Type);
-//
-//		if (vma.Type == 0) {
-//			StackVMA = vma;
-//		}
-//	}
-//
-//	fclose(maps);
-//}
-
 static void LoadFriendlyNames()
 {
 	KernelNameMap["_Z21bilateralFilterKernelPfPKf23__device_builtin__uint2S1_fi"] = "Bilateral Filter";
@@ -593,11 +619,12 @@ int main(int argc, char *argv[])
 	LoadFriendlyNames();
 	
 	IMG_AddInstrumentFunction(Image, NULL);
+	RTN_AddInstrumentFunction(Routine, NULL);	
+	INS_AddInstrumentFunction(Instruction, NULL);
 	
-	RTN_AddInstrumentFunction(Routine, NULL);
-	
-	if (KnobTraceMemory.Value())
-		INS_AddInstrumentFunction(Instruction, NULL);
+	if (KnobTraceKInst.Value()) {
+		TraceFile = fopen("./trace.bin", "wb");
+	}
 	
 	PIN_AddFiniFunction(Fini, NULL);
 			
