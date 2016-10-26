@@ -22,7 +22,7 @@ SA_TOOL_ROOTS :=
 APP_ROOTS :=
 
 # This defines any additional object files that need to be compiled.
-OBJECT_ROOTS := d4misc.o
+OBJECT_ROOTS := 
 
 # This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
 DLL_ROOTS :=
@@ -39,7 +39,7 @@ SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
 TOOL_CXXFLAGS += -std=gnu++11 -Id4-7
 TOOL_CFLAGS += -std=gnu99 -Id4-7
 
-TOOL_LDFLAGS += -L. -ld4
+TOOL_LDFLAGS += 
 
 ##############################################################
 #
