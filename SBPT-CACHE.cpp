@@ -13,6 +13,12 @@
 #include <time.h>
 #include <sys/time.h>
 
+extern "C" {
+#include <d4.h>
+}
+
+d4cache *mm, *l2, *l1d;
+
 static uint64_t now()
 {
 	struct timeval tv;
@@ -85,6 +91,18 @@ void KernelRoutineEnter(KernelDescriptor *descriptor)
 	CurrentKernel->Duration = now();
 }
 
+static void DumpCacheStats()
+{
+	fprintf(stderr, "l1d: read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l1d->fetch[D4XREAD], (uint64_t)l1d->fetch[D4XREAD] - (uint64_t)l1d->miss[D4XREAD], (uint64_t)l1d->miss[D4XREAD]);
+	fprintf(stderr, "l1d: write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l1d->fetch[D4XWRITE], (uint64_t)l1d->fetch[D4XWRITE] - (uint64_t)l1d->miss[D4XWRITE], (uint64_t)l1d->miss[D4XWRITE]);
+
+	fprintf(stderr, "l2:  read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l2->fetch[D4XREAD], (uint64_t)l2->fetch[D4XREAD] - (uint64_t)l2->miss[D4XREAD], (uint64_t)l2->miss[D4XREAD]);
+	fprintf(stderr, "l2:  write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l2->fetch[D4XWRITE], (uint64_t)l2->fetch[D4XWRITE] - (uint64_t)l2->miss[D4XWRITE], (uint64_t)l2->miss[D4XWRITE]);
+	
+	fprintf(stderr, "mem: read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)mm->fetch[D4XREAD], (uint64_t)mm->fetch[D4XREAD] - (uint64_t)mm->miss[D4XREAD], (uint64_t)mm->miss[D4XREAD]);
+	fprintf(stderr, "mem: write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)mm->fetch[D4XWRITE], (uint64_t)mm->fetch[D4XWRITE] - (uint64_t)mm->miss[D4XWRITE], (uint64_t)mm->miss[D4XWRITE]);
+}
+
 void KernelRoutineExit(KernelDescriptor *descriptor)
 {
 	ASSERT(CurrentFrame, "A frame is not in progress");
@@ -95,13 +113,40 @@ void KernelRoutineExit(KernelDescriptor *descriptor)
 	
 	CurrentKernel->Descriptor->TotalExecutionCount++;
 	CurrentKernel->Descriptor->TotalExecutionTime += CurrentKernel->Duration;
+	
+	if (CurrentFrame->Index >= SKIP_FRAME) {
+		fprintf(stderr, "*** KERNEL: %s\n", CurrentKernel->Descriptor->Name.c_str());
+		DumpCacheStats();
+		fprintf(stderr, "************\n");
+	}
+
 	CurrentKernel = NULL;
 }
 
-void InstructionExecuted(VOID *rip, uint64_t opcode, uint64_t opclass)
+static void MemoryAccessCommon(uintptr_t addr, bool read)
+{
+	d4memref memref;
+	memref.address = (d4addr)addr;
+	memref.size = 4;
+	memref.accesstype = read ? D4XREAD : D4XWRITE;
+
+	d4ref(l1d, memref);
+}
+
+void MemoryReadInstruction(void *rip, uintptr_t addr)
 {
 	if (!CurrentKernel) return;
 	if (CurrentFrame->Index < SKIP_FRAME) return;
+
+	MemoryAccessCommon(addr, true);
+}
+
+void MemoryWriteInstruction(void *rip, uintptr_t addr)
+{
+	if (!CurrentKernel) return;
+	if (CurrentFrame->Index < SKIP_FRAME) return;
+	
+	MemoryAccessCommon(addr, false);
 }
 
 std::map<std::string, std::string> KernelNameMap;
@@ -149,11 +194,18 @@ void Routine(RTN rtn, VOID *v)
 
 void Instruction(INS ins, VOID *p)
 {
-	INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InstructionExecuted, 
-			IARG_INST_PTR,
-			IARG_PTR, (uint64_t)INS_Opcode(ins),
-			IARG_PTR, (uint64_t)INS_Category(ins),
-			IARG_END);
+	unsigned int operand_count = INS_MemoryOperandCount(ins);
+	if (operand_count > 0) {
+		for (unsigned int operand_index = 0; operand_index < operand_count; operand_index++) {
+			if (INS_MemoryOperandIsRead(ins, operand_index)) {
+				INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryReadInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_END);
+			}
+
+			if (INS_MemoryOperandIsWritten(ins, operand_index)) {
+				INS_InsertPredicatedCall(ins, IPOINT_BEFORE, (AFUNPTR)MemoryWriteInstruction, IARG_INST_PTR, IARG_MEMORYOP_EA, operand_index, IARG_END);
+			}
+		}
+	}
 }
 
 void Fini(INT32 code, void *v)
@@ -181,6 +233,66 @@ static void LoadFriendlyNames()
 	KernelNameMap["_Z16updatePoseKernelR8sMatrix4PKff"] = "UpdatePose";
 }
 
+static void InitCache()
+{
+	mm = d4new(NULL);
+	mm->name = (char *)"memory";
+	
+	l2 = d4new(mm);
+	l2->name = (char *)"l2";
+	l2->flags = 0;
+		
+	l2->lg2blocksize = 6;
+	l2->lg2subblocksize = 6;
+	l2->lg2size = 20;
+	l2->assoc = 8;
+	
+	l2->replacementf = d4rep_lru;
+	l2->name_replacement = (char *)"LRU";
+	
+	l2->prefetchf = d4prefetch_none;
+	l2->name_prefetch = (char *)"demand only";
+	
+	l2->wallocf = d4walloc_never;
+	l2->name_walloc = (char *)"never";
+	
+	l2->wbackf = d4wback_never;
+	l2->name_wback = (char *)"never";
+	
+	l2->prefetch_distance = 6;
+	l2->prefetch_abortpercent = 0;
+	
+	l1d = d4new(l2);
+	l1d->name = (char *)"l1d";
+	l1d->flags = 0;
+		
+	l1d->lg2blocksize = 6;
+	l1d->lg2subblocksize = 6;
+	l1d->lg2size = 15;
+	l1d->assoc = 4;
+	
+	l1d->replacementf = d4rep_random;
+	l1d->name_replacement = (char *)"random";
+	
+	l1d->prefetchf = d4prefetch_none;
+	l1d->name_prefetch = (char *)"demand only";
+	
+	l1d->wallocf = d4walloc_never;
+	l1d->name_walloc = (char *)"never";
+	
+	l1d->wbackf = d4wback_never;
+	l1d->name_wback = (char *)"never";
+	
+	l1d->prefetch_distance = 6;
+	l1d->prefetch_abortpercent = 0;
+	
+	int err = d4setup();
+	if (err) {
+		fprintf(stderr, "ERROR: %d\n", err);
+		_exit(-1);
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	PIN_InitSymbols();
@@ -192,6 +304,8 @@ int main(int argc, char *argv[])
 
 		return 1;
 	}
+	
+	InitCache();
 	
 	LoadFriendlyNames();
 	
