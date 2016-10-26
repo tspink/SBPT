@@ -16,6 +16,7 @@ KNOB<bool> KnobTraceMemory(KNOB_MODE_WRITEONCE, "pintool", "trace_mem", "0", "Sh
 KNOB<bool> KnobTraceReuse(KNOB_MODE_WRITEONCE, "pintool", "trace_reuse", "0", "Should trace reuses");
 KNOB<bool> KnobTraceTimes(KNOB_MODE_WRITEONCE, "pintool", "trace_timing", "0", "Should trace times");
 KNOB<bool> KnobTraceKInst(KNOB_MODE_WRITEONCE, "pintool", "trace_kinst", "0", "Should trace kernel instructions");
+KNOB<bool> KnobTraceSeq(KNOB_MODE_WRITEONCE, "pintool", "trace_seq", "0", "Should trace instruction sequences");
 
 static uint64_t now()
 {
@@ -365,11 +366,7 @@ void Instruction(INS ins, VOID *p)
 	}
 	
 	if (KnobTraceKInst.Value()) {
-		/*RTN parent = INS_Rtn(ins);
-		SEC parent_section = RTN_Sec(parent);
-		if (SEC_Name(parent_section) == ".kernel") {*/
-			INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InstructionExecuted, IARG_INST_PTR, IARG_END);
-		//}
+		INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InstructionExecuted, IARG_INST_PTR, IARG_PTR, (uint64_t)INS_Opcode(ins), IARG_END);
 	}
 }
 
