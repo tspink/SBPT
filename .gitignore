@@ -1,3 +1,6 @@
 obj-*
 pin.log
 nbproject/
+*.dot
+*.pdf
+*.o

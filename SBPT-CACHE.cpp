@@ -63,6 +63,47 @@ static int CurrentFrameIndex;
 
 #define SKIP_FRAME 5
 
+/*static void DumpCacheStats()
+{
+	uint64_t rhits = (uint64_t)l1d->fetch[D4XREAD] - (uint64_t)l1d->miss[D4XREAD];
+	uint64_t rmisses= (uint64_t)l1d->miss[D4XREAD];
+	uint64_t raccesses = rhits + rmisses;
+	
+	uint64_t whits = (uint64_t)l1d->fetch[D4XWRITE] - (uint64_t)l1d->miss[D4XWRITE];
+	uint64_t wmisses= (uint64_t)l1d->miss[D4XWRITE];
+	uint64_t waccesses = whits + wmisses;
+	
+	fprintf(stderr, "L1D: R Hit Ratio=%lf%%, Miss Ratio=%lf%%\n", ((double)rhits / (double)raccesses) * 100.f, ((double)rmisses / (double)raccesses) * 100.f);
+	fprintf(stderr, "L1D: W Hit Ratio=%lf%%, Miss Ratio=%lf%%\n", ((double)whits / (double)waccesses) * 100.f, ((double)wmisses / (double)waccesses) * 100.f);
+	
+	/ * fprintf(stderr, "l1d: read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l1d->fetch[D4XREAD], (uint64_t)l1d->fetch[D4XREAD] - (uint64_t)l1d->miss[D4XREAD], (uint64_t)l1d->miss[D4XREAD]);
+	fprintf(stderr, "l1d: write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l1d->fetch[D4XWRITE], (uint64_t)l1d->fetch[D4XWRITE] - (uint64_t)l1d->miss[D4XWRITE], (uint64_t)l1d->miss[D4XWRITE]);
+
+	fprintf(stderr, "l2:  read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l2->fetch[D4XREAD], (uint64_t)l2->fetch[D4XREAD] - (uint64_t)l2->miss[D4XREAD], (uint64_t)l2->miss[D4XREAD]);
+	fprintf(stderr, "l2:  write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l2->fetch[D4XWRITE], (uint64_t)l2->fetch[D4XWRITE] - (uint64_t)l2->miss[D4XWRITE], (uint64_t)l2->miss[D4XWRITE]);
+	
+	fprintf(stderr, "mem: read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)mm->fetch[D4XREAD], (uint64_t)mm->fetch[D4XREAD] - (uint64_t)mm->miss[D4XREAD], (uint64_t)mm->miss[D4XREAD]);
+	fprintf(stderr, "mem: write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)mm->fetch[D4XWRITE], (uint64_t)mm->fetch[D4XWRITE] - (uint64_t)mm->miss[D4XWRITE], (uint64_t)mm->miss[D4XWRITE]);* /
+}*/
+
+static void ResetCacheStats()
+{
+	l1d->fetch[D4XREAD] = 0;
+	l1d->miss[D4XREAD] = 0;
+	l1d->fetch[D4XWRITE] = 0;
+	l1d->miss[D4XWRITE] = 0;
+	
+	l2->fetch[D4XREAD] = 0;
+	l2->miss[D4XREAD] = 0;
+	l2->fetch[D4XWRITE] = 0;
+	l2->miss[D4XWRITE] = 0;
+
+	mm->fetch[D4XREAD] = 0;
+	mm->miss[D4XREAD] = 0;
+	mm->fetch[D4XWRITE] = 0;
+	mm->miss[D4XWRITE] = 0;
+}
+
 void FrameStart()
 {
 	ASSERT(!CurrentFrame, "A frame is already in progress");
@@ -79,6 +120,7 @@ void FrameEnd()
 	CurrentFrame->Duration = now() - CurrentFrame->Duration;
 	
 	FrameDescriptors.push_back(CurrentFrame);
+	fprintf(stderr, "********* END FRAME\n");
 	CurrentFrame = NULL;
 }
 
@@ -89,18 +131,13 @@ void KernelRoutineEnter(KernelDescriptor *descriptor)
 
 	CurrentKernel = new KernelInvocation(descriptor);
 	CurrentKernel->Duration = now();
-}
 
-static void DumpCacheStats()
-{
-	fprintf(stderr, "l1d: read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l1d->fetch[D4XREAD], (uint64_t)l1d->fetch[D4XREAD] - (uint64_t)l1d->miss[D4XREAD], (uint64_t)l1d->miss[D4XREAD]);
-	fprintf(stderr, "l1d: write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l1d->fetch[D4XWRITE], (uint64_t)l1d->fetch[D4XWRITE] - (uint64_t)l1d->miss[D4XWRITE], (uint64_t)l1d->miss[D4XWRITE]);
+	ResetCacheStats();
 
-	fprintf(stderr, "l2:  read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l2->fetch[D4XREAD], (uint64_t)l2->fetch[D4XREAD] - (uint64_t)l2->miss[D4XREAD], (uint64_t)l2->miss[D4XREAD]);
-	fprintf(stderr, "l2:  write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)l2->fetch[D4XWRITE], (uint64_t)l2->fetch[D4XWRITE] - (uint64_t)l2->miss[D4XWRITE], (uint64_t)l2->miss[D4XWRITE]);
-	
-	fprintf(stderr, "mem: read:  accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)mm->fetch[D4XREAD], (uint64_t)mm->fetch[D4XREAD] - (uint64_t)mm->miss[D4XREAD], (uint64_t)mm->miss[D4XREAD]);
-	fprintf(stderr, "mem: write: accesses=%lu, hits=%lu, misses=%lu\n", (uint64_t)mm->fetch[D4XWRITE], (uint64_t)mm->fetch[D4XWRITE] - (uint64_t)mm->miss[D4XWRITE], (uint64_t)mm->miss[D4XWRITE]);
+	/*d4memref memref;
+	memref.address = (d4addr)addr;
+	memref.size = 4;
+	memref.accesstype = D4XINVAL;*/
 }
 
 void KernelRoutineExit(KernelDescriptor *descriptor)
@@ -115,11 +152,23 @@ void KernelRoutineExit(KernelDescriptor *descriptor)
 	CurrentKernel->Descriptor->TotalExecutionTime += CurrentKernel->Duration;
 	
 	if (CurrentFrame->Index >= SKIP_FRAME) {
-		fprintf(stderr, "*** KERNEL: %s\n", CurrentKernel->Descriptor->Name.c_str());
+		/*fprintf(stderr, "**** KERNEL CACHE STATS %s ****\n", CurrentKernel->Descriptor->Name.c_str());
 		DumpCacheStats();
-		fprintf(stderr, "************\n");
-	}
+		fprintf(stderr, "************\n");*/
+		
+		uint64_t rhits = (uint64_t)l1d->fetch[D4XREAD] - (uint64_t)l1d->miss[D4XREAD];
+		uint64_t rmisses= (uint64_t)l1d->miss[D4XREAD];
+		uint64_t raccesses = rhits + rmisses;
 
+		uint64_t whits = (uint64_t)l1d->fetch[D4XWRITE] - (uint64_t)l1d->miss[D4XWRITE];
+		uint64_t wmisses= (uint64_t)l1d->miss[D4XWRITE];
+		uint64_t waccesses = whits + wmisses;
+		
+		std::cerr << CurrentKernel->Descriptor->Name << ","
+				<< std::dec << raccesses << "," << rhits << "," << rmisses << ","
+				<< std::dec << waccesses << "," << whits << "," << wmisses << std::endl;
+	}
+	
 	CurrentKernel = NULL;
 }
 
@@ -277,8 +326,8 @@ static void InitCache()
 	l1d->prefetchf = d4prefetch_none;
 	l1d->name_prefetch = (char *)"demand only";
 	
-	l1d->wallocf = d4walloc_never;
-	l1d->name_walloc = (char *)"never";
+	l1d->wallocf = d4walloc_always;
+	l1d->name_walloc = (char *)"always";
 	
 	l1d->wbackf = d4wback_never;
 	l1d->name_wback = (char *)"never";

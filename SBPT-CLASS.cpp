@@ -8,12 +8,9 @@
 #include <fstream>
 #include <list>
 #include <map>
-#include <string>
-#include <sstream>
 #include <set>
 #include <unordered_map>
 #include <time.h>
-#include <sys/time.h>
 
 static uint64_t now()
 {
@@ -33,27 +30,14 @@ struct KernelDescriptor
 	uint64_t TotalExecutionTime;
 };
 
-struct SequenceNode
-{
-	SequenceNode() : Count(0) { }
-	
-	uint64_t Opcode;
-	uint64_t Count;
-	
-	std::map<uint64_t, SequenceNode> Children;
-};
-
 struct KernelInvocation
 {
-	KernelInvocation(KernelDescriptor *descriptor) : Index(0), Descriptor(descriptor), Duration(0) { }
-	
-	uint64_t Index;
+	KernelInvocation(KernelDescriptor *descriptor) : Descriptor(descriptor), Duration(0) { }
 	
 	KernelDescriptor *Descriptor;
 	uint64_t Duration;
 	
-	std::vector<uint64_t> CurrentSequence;
-	SequenceNode Root;
+	std::map<uint64_t, uint64_t> ClassExecutions;
 };
 
 struct FrameDescriptor
@@ -72,8 +56,6 @@ static int NextKernelID;
 
 static int CurrentFrameIndex;
 
-#define SKIP_FRAME 5
-
 void FrameStart()
 {
 	ASSERT(!CurrentFrame, "A frame is already in progress");
@@ -91,6 +73,12 @@ void FrameEnd()
 	
 	FrameDescriptors.push_back(CurrentFrame);
 	CurrentFrame = NULL;
+	
+	std::cerr << "***" << std::endl;
+	for (unsigned int i = 0; i < XED_CATEGORY_LAST; i++) {
+		std::cerr << "," << CATEGORY_StringShort(i);
+	}
+	std::cerr << std::endl << "***" << std::endl;
 }
 
 void KernelRoutineEnter(KernelDescriptor *descriptor)
@@ -99,30 +87,7 @@ void KernelRoutineEnter(KernelDescriptor *descriptor)
 	ASSERT(!CurrentKernel, "A kernel is already in progress");
 
 	CurrentKernel = new KernelInvocation(descriptor);
-	CurrentKernel->Index = CurrentFrame->KernelInvocations.size();
 	CurrentKernel->Duration = now();
-	CurrentKernel->Root.Opcode = 0;
-	
-	/*for (uint64_t i = 0; i < XED_ICLASS_LAST; i++) {
-		DictionaryEntry e;
-		e.Sequence.push_back(i);
-		
-		CurrentKernel->LZW.push_back(e);
-	}*/
-}
-
-static void DumpTree(std::ofstream& f, const SequenceNode& node, uint64_t total)
-{
-	f << "P_" << std::hex << (uint64_t)&node << " [label=\"" << OPCODE_StringShort(node.Opcode) << "\"];" << std::endl;
-	
-	for (const auto& child : node.Children) {
-		f << "P_" << std::hex << (uint64_t)&node 
-				<< " -> " 
-				<< "P_" << std::hex << (uint64_t)&child.second 
-				<< " [label=\"" << std::dec << std::setprecision(2) << (((double)child.second.Count * 100.0) / (double)total) << "\"]"
-				<< ";" << std::endl;
-		DumpTree(f, child.second, total);
-	}
 }
 
 void KernelRoutineExit(KernelDescriptor *descriptor)
@@ -133,70 +98,37 @@ void KernelRoutineExit(KernelDescriptor *descriptor)
 	CurrentKernel->Duration = now() - CurrentKernel->Duration;
 	CurrentFrame->KernelInvocations.push_back(CurrentKernel);
 	
-	if (CurrentFrame->Index >= SKIP_FRAME) {
-		//std::cerr << "*** KERNEL " << CurrentKernel->Descriptor->Name << std::endl;
-		
-		uint64_t total = 0;
-		for (auto n : CurrentKernel->Root.Children) {
-			total += n.second.Count;
-		}
-		
-		std::stringstream s;
-		s << "seq-" << CurrentKernel->Descriptor->Name << "." << std::dec << CurrentKernel->Index << "." << CurrentFrame->Index << ".dot";
-		std::ofstream f(s.str().c_str());
-		
-		f << "digraph a {" << std::endl;
-		DumpTree(f, CurrentKernel->Root, total);
-		f << "}" << std::endl;
-		
-		//std::cerr << "*** END ***" << std::endl;
-	}
-	
-	CurrentKernel->Root.Children.clear();
-	
 	CurrentKernel->Descriptor->TotalExecutionCount++;
 	CurrentKernel->Descriptor->TotalExecutionTime += CurrentKernel->Duration;
-	CurrentKernel = NULL;
+	
+	if (CurrentFrame->Index >= 5) {
+		std::cerr << CurrentKernel->Descriptor->Name;
+
+		for (unsigned int i = 0; i < XED_CATEGORY_LAST; i++) {
+			std::cerr << "," << std::dec << CurrentKernel->ClassExecutions[i];
+		}
+
+		std::cerr << std::endl;
+	}
+	
+	CurrentKernel = NULL;	
 }
 
-void InstructionExecuted(VOID *rip, uint64_t opcode, uint64_t opclass)
+void InstructionExecuted(VOID *rip, uint64_t opcode, uint64_t category)
 {
+	if (!CurrentFrame) return;
 	if (!CurrentKernel) return;
-	if (CurrentFrame->Index < SKIP_FRAME) return;
+	if (CurrentFrame->Index < 5) return;
 	
-	if (opclass == XED_CATEGORY_UNCOND_BR || opclass == XED_CATEGORY_COND_BR || opclass == XED_CATEGORY_RET) {
-		CurrentKernel->CurrentSequence.clear();
-		return;
-	}
-	
-	CurrentKernel->CurrentSequence.push_back(opcode);
-	
-	SequenceNode *current_node = &CurrentKernel->Root;
-	
-	unsigned int CurrentSymbol;
-	for (CurrentSymbol = 0; CurrentSymbol < CurrentKernel->CurrentSequence.size(); CurrentSymbol++) {
-		auto child = current_node->Children.find(CurrentKernel->CurrentSequence[CurrentSymbol]);
-		if (child != current_node->Children.end()) {
-			current_node = &child->second;
-		} else {
-			break;
-		}
-	}
-	
-	while (CurrentSymbol < CurrentKernel->CurrentSequence.size()) {
-		uint64_t opcode = CurrentKernel->CurrentSequence[CurrentSymbol];
-		current_node->Children[opcode].Opcode = opcode;
-		current_node = &(current_node->Children[opcode]);
-		CurrentSymbol++;
-	}
-	
-	current_node->Count++;
+	CurrentKernel->ClassExecutions[category]++;
 }
 
 std::map<std::string, std::string> KernelNameMap;
 
 void Routine(RTN rtn, VOID *v)
 {
+	// std::cerr << "Routine: " << RTN_Name(rtn) << std::endl;
+	
 	if (RTN_Name(rtn) == "FRAME_START") {
 		std::cerr << "Located FRAME_START directive" << std::endl;
 		RTN_Open(rtn);
@@ -216,6 +148,8 @@ void Routine(RTN rtn, VOID *v)
 	// Ignore routines that aren't part of the ".kernel" ELF section
 	if (SEC_Name(sec) != ".kernel") return;
 	
+	std::cerr << "Identified kernel routine: " << RTN_Name(rtn) << std::endl;
+	
 	std::string name;
 	
 	auto friendly = KernelNameMap.find(RTN_Name(rtn));
@@ -224,8 +158,6 @@ void Routine(RTN rtn, VOID *v)
 	} else {
 		name = friendly->second;
 	}
-	
-	std::cerr << "Identified kernel routine: " << name << std::endl;
 	
 	KernelDescriptor *descriptor = new KernelDescriptor(NextKernelID++, name);
 	KernelDescriptors.push_back(descriptor);
@@ -239,9 +171,9 @@ void Routine(RTN rtn, VOID *v)
 void Instruction(INS ins, VOID *p)
 {
 	INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)InstructionExecuted, 
-			IARG_INST_PTR,
-			IARG_PTR, (uint64_t)INS_Opcode(ins),
-			IARG_PTR, (uint64_t)INS_Category(ins),
+			IARG_INST_PTR, 
+			IARG_PTR, (uint64_t)INS_Opcode(ins), 
+			IARG_PTR, (uint64_t)INS_Category(ins), 
 			IARG_END);
 }
 
@@ -251,9 +183,14 @@ void Fini(INT32 code, void *v)
 	std::cerr << "*** SLAMBench Completed ***" << std::endl;
 }
 
+void Image(IMG img, VOID *v)
+{
+	std::cerr << "IMAGE: " << IMG_Name(img) << std::endl;
+}
+
 static void LoadFriendlyNames()
 {
-	KernelNameMap["_Z21bilateralFilterKernelPfPKf23__device_builtin__uint2S1_fi"] = "BilateralFilter";
+	KernelNameMap["_Z21bilateralFilterKernelPfPKf23__device_builtin__uint2S1_fi"] = "Bilateral Filter";
 	KernelNameMap["_Z18depth2vertexKernelP24__device_builtin__float3PKf23__device_builtin__uint28sMatrix4"] = "Depth2Vertex";
 	KernelNameMap["_Z19vertex2normalKernelP24__device_builtin__float3PKS_23__device_builtin__uint2"] = "Vertex2Normal";
 	KernelNameMap["_Z12reduceKernelPfP9TrackData23__device_builtin__uint2S2_"] = "Reduce";
@@ -284,11 +221,12 @@ int main(int argc, char *argv[])
 	
 	LoadFriendlyNames();
 	
+	IMG_AddInstrumentFunction(Image, NULL);
 	RTN_AddInstrumentFunction(Routine, NULL);	
 	INS_AddInstrumentFunction(Instruction, NULL);
-
-	PIN_AddFiniFunction(Fini, NULL);			
-	PIN_StartProgram();
 	
+	PIN_AddFiniFunction(Fini, NULL);
+			
+	PIN_StartProgram();
 	return 0;
 }
